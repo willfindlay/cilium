@@ -352,6 +352,9 @@ New Options
 * ``kvstore-max-consecutive-quorum-errors``: This option configures the max
   acceptable kvstore consecutive quorum errors before the agent assumes
   permanent failure.
+* ``ipv6-native-routing-cidr``: This option specifies the IPv6 CIDR for native
+  routing. It must be set whenever running in direct routing mode with IPv6
+  masquerading enabled.
 
 Helm Options
 ~~~~~~~~~~~~
