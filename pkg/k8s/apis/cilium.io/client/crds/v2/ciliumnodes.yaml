@@ -540,6 +540,20 @@ spec:
                     description: Used lists all IPs out of Spec.IPAM.Pool which have
                       been allocated and are in use.
                     type: object
+                  used-pod-cidrs:
+                    additionalProperties:
+                      properties:
+                        status:
+                          description: Status describes the status of a pod CIDR
+                          enum:
+                          - released
+                          - depleted
+                          - in-use
+                          type: string
+                      type: object
+                    description: UsedPodCIDRs lists the status of each pod CIDR allocated
+                      to this node.
+                    type: object
                 type: object
             type: object
         required:

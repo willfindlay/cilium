@@ -110,10 +110,33 @@ type IPAMStatus struct {
 	// +optional
 	Used AllocationMap `json:"used,omitempty"`
 
+	// UsedPodCIDRs lists the status of each pod CIDR allocated to this node.
+	//
+	// +optional
+	UsedPodCIDRs UsedPodCIDRMap `json:"used-pod-cidrs,omitempty"`
+
 	// Operator is the Operator status of the node
 	//
 	// +optional
 	OperatorStatus OperatorStatus `json:"operator-status,omitempty"`
+}
+
+type UsedPodCIDRMap map[string]UsedPodCIDR
+
+// +kubebuilder:validation:Enum=released;depleted;in-use
+type UsedPodCIDRStatus string
+
+const (
+	PodCIDRStatusReleased UsedPodCIDRStatus = "released"
+	PodCIDRStatusDepleted UsedPodCIDRStatus = "depleted"
+	PodCIDRStatusInUse    UsedPodCIDRStatus = "in-use"
+)
+
+type UsedPodCIDR struct {
+	// Status describes the status of a pod CIDR
+	//
+	// +optional
+	Status UsedPodCIDRStatus `json:"status,omitempty"`
 }
 
 // OperatorStatus is the status used by cilium-operator to report
