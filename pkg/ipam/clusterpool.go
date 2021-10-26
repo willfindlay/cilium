@@ -252,10 +252,26 @@ func podCIDRFamily(podCIDR string) Family {
 	return IPv4
 }
 
+type localNodeInformer interface {
+	subscribe(k8sEventReg K8sEventRegister, onUpsert func(*ciliumv2.CiliumNode), onDelete func())
+}
+
+type defaultNodeInformer struct{}
+
+func (d *defaultNodeInformer) subscribe(k8sEventReg K8sEventRegister, onUpsert func(*ciliumv2.CiliumNode), onDelete func()) {
+	startLocalCiliumNodeInformer(nodeTypes.GetName(), k8sEventReg,
+		onUpsert, onDelete)
+}
+
+type nodeUpdater interface {
+	UpdateStatus(ctx context.Context, ciliumNode *ciliumv2.CiliumNode, opts metav1.UpdateOptions) (*ciliumv2.CiliumNode, error)
+}
+
 type crdWatcher struct {
-	mutex      lock.Mutex
-	pools      map[Family]*podCIDRPool
-	controller *controller.Manager
+	mutex       lock.Mutex
+	pools       map[Family]*podCIDRPool
+	controller  *controller.Manager
+	nodeUpdater nodeUpdater
 
 	node               *ciliumv2.CiliumNode
 	previouslyReleased map[Family][]string
@@ -264,17 +280,17 @@ type crdWatcher struct {
 var crdWatcherInit sync.Once
 var sharedCRDWatcher *crdWatcher
 
-func newCRDWatcher(k8sEventReg K8sEventRegister) *crdWatcher {
+func newCRDWatcher(k8sEventReg K8sEventRegister, localNodeInformer localNodeInformer, nodeUpdater nodeUpdater) *crdWatcher {
 	c := &crdWatcher{
 		mutex:              lock.Mutex{},
 		pools:              map[Family]*podCIDRPool{},
 		controller:         controller.NewManager(),
+		nodeUpdater:        nodeUpdater,
 		node:               nil,
 		previouslyReleased: map[Family][]string{},
 	}
 
-	startLocalCiliumNodeInformer(nodeTypes.GetName(), k8sEventReg,
-		c.localNodeUpdated, c.localNodeDeleted)
+	localNodeInformer.subscribe(k8sEventReg, c.localNodeUpdated, c.localNodeDeleted)
 
 	c.controller.UpdateController("sync-clusterpool-status", controller.ControllerParams{
 		DoFunc:      c.updateCiliumNodeStatus,
@@ -367,8 +383,7 @@ func (c *crdWatcher) updateCiliumNodeStatus(ctx context.Context) error {
 	}
 
 	log.WithField("status", node.Status.IPAM.UsedPodCIDRs).Info("update status")
-	_, err := k8s.CiliumClient().CiliumV2().CiliumNodes().
-		UpdateStatus(ctx, node, metav1.UpdateOptions{})
+	_, err := c.nodeUpdater.UpdateStatus(ctx, node, metav1.UpdateOptions{})
 	return err
 }
 
@@ -380,7 +395,9 @@ func newClusterPoolAllocator(family Family, k8sEventReg K8sEventRegister) Alloca
 	pool := newPodCIDRPool(family)
 
 	crdWatcherInit.Do(func() {
-		sharedCRDWatcher = newCRDWatcher(k8sEventReg)
+		nodeClient := k8s.CiliumClient().CiliumV2().CiliumNodes()
+		nodeInformer := &defaultNodeInformer{}
+		sharedCRDWatcher = newCRDWatcher(k8sEventReg, nodeInformer, nodeClient)
 	})
 	sharedCRDWatcher.setPodCIDRPool(family, pool)
 

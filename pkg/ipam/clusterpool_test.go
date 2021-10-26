@@ -1,13 +1,66 @@
 package ipam
 
 import (
+	"context"
 	"net"
 	"testing"
 
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/cilium/cilium/pkg/lock"
+
 	"github.com/cilium/cilium/pkg/ipam/types"
+	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 
 	. "github.com/onsi/gomega"
 )
+
+type fakeK8sCiliumNodeAPI struct {
+	mutex lock.Mutex
+	node  *ciliumv2.CiliumNode
+
+	onUpsert func(*ciliumv2.CiliumNode)
+	onDelete func()
+}
+
+// subscribe implements localNodeInformer
+func (f *fakeK8sCiliumNodeAPI) subscribe(_ K8sEventRegister, onUpsert func(*ciliumv2.CiliumNode), onDelete func()) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	f.onUpsert = onUpsert
+	f.onDelete = onDelete
+}
+
+// UpdateStatus implements nodeUpdater
+func (f *fakeK8sCiliumNodeAPI) UpdateStatus(_ context.Context, ciliumNode *ciliumv2.CiliumNode, _ v1.UpdateOptions) (*ciliumv2.CiliumNode, error) {
+	f.updateNode(ciliumNode)
+	return ciliumNode, nil
+}
+
+// updateNode is to be invoked by the test code to simulate writes by the operator
+func (f *fakeK8sCiliumNodeAPI) updateNode(node *ciliumv2.CiliumNode) {
+	f.mutex.Lock()
+	onUpsert := f.onUpsert
+	f.node = node
+	f.mutex.Unlock()
+
+	if onUpsert != nil {
+		onUpsert(node)
+	}
+}
+
+// updateNode is to be invoked by the test code to simulate an unexpected node deletion
+func (f *fakeK8sCiliumNodeAPI) deleteNode() {
+	f.mutex.Lock()
+	onDelete := f.onDelete
+	f.node = nil
+	f.mutex.Unlock()
+
+	if onDelete != nil {
+		onDelete()
+	}
+}
 
 func TestPodCIDRPool(t *testing.T) {
 	for _, tc := range []struct {
@@ -255,6 +308,7 @@ func TestNewCRDWatcher(t *testing.T) {
 	RegisterTestingT(t)
 
 	Expect(func() {
-		_ = newCRDWatcher(&ownerMock{})
+		mockNodeAPI := &fakeK8sCiliumNodeAPI{}
+		_ = newCRDWatcher(&ownerMock{}, mockNodeAPI, mockNodeAPI)
 	}).NotTo(Panic())
 }
