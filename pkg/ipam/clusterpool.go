@@ -12,23 +12,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/sirupsen/logrus"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/cilium/cilium/pkg/k8s"
-
 	"github.com/cilium/cilium/pkg/controller"
-
 	"github.com/cilium/cilium/pkg/ipam/types"
-
+	"github.com/cilium/cilium/pkg/k8s"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	nodeTypes "github.com/cilium/cilium/pkg/node/types"
-
 	"github.com/cilium/cilium/pkg/lock"
-
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/ipam/service/ipallocator"
+
+	"github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // TODO make these either cilium-agent CLI flags or part of the CRD
@@ -37,29 +31,15 @@ const (
 	releaseThreshold   = 16 // globally
 )
 
-func newPodCIDRAllocator(podCIDR string) (*ipallocator.Range, error) {
-	_, cidr, err := net.ParseCIDR(podCIDR)
-	if err != nil {
-		return nil, fmt.Errorf("invalid pod CIDR: %w", err)
-	}
-
-	return ipallocator.NewCIDRRange(cidr)
-}
-
+// A podCIDRPool manages the allocation of IPs in multiple pod CIDRs.
 type podCIDRPool struct {
-	mutex    lock.Mutex
-	family   Family
-	pool     map[string]*ipallocator.Range
-	podCIDRs []string
-	released map[string]struct{}
+	mutex        lock.Mutex
+	ipAllocators []*ipallocator.Range
+	released     map[string]struct{}
 }
 
-func newPodCIDRPool(family Family) *podCIDRPool {
+func newPodCIDRPool() *podCIDRPool {
 	return &podCIDRPool{
-		mutex:    lock.Mutex{},
-		family:   family,
-		pool:     map[string]*ipallocator.Range{},
-		podCIDRs: []string{},
 		released: map[string]struct{}{},
 	}
 }
@@ -68,10 +48,10 @@ func (p *podCIDRPool) allocate(ip net.IP) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	for _, alloc := range p.pool {
-		cidr := alloc.CIDR()
-		if cidr.Contains(ip) {
-			return alloc.Allocate(ip)
+	for _, ipAllocator := range p.ipAllocators {
+		cidrNet := ipAllocator.CIDR()
+		if cidrNet.Contains(ip) {
+			return ipAllocator.Allocate(ip)
 		}
 	}
 
@@ -84,10 +64,11 @@ func (p *podCIDRPool) allocateNext() (net.IP, error) {
 
 	// When allocating a random IP, we try the pod CIDRs in the order they are
 	// listed in the CRD. This avoids internal fragmentation.
-	for _, cidr := range p.podCIDRs {
-		if alloc := p.pool[cidr]; alloc != nil && alloc.Free() > 0 {
-			return alloc.AllocateNext()
+	for _, ipAllocator := range p.ipAllocators {
+		if ipAllocator.Free() == 0 {
+			continue
 		}
+		return ipAllocator.AllocateNext()
 	}
 
 	return nil, errors.New("all pod CIDR ranges are exhausted")
@@ -97,10 +78,10 @@ func (p *podCIDRPool) release(ip net.IP) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	for _, alloc := range p.pool {
-		cidr := alloc.CIDR()
-		if cidr.Contains(ip) {
-			return alloc.Release(ip)
+	for _, ipAllocator := range p.ipAllocators {
+		cidrNet := ipAllocator.CIDR()
+		if cidrNet.Contains(ip) {
+			return ipAllocator.Release(ip)
 		}
 	}
 
@@ -111,8 +92,8 @@ func (p *podCIDRPool) hasAvailableIPs() bool {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	for _, alloc := range p.pool {
-		if alloc.Free() > 0 {
+	for _, ipAllocator := range p.ipAllocators {
+		if ipAllocator.Free() > 0 {
 			return true
 		}
 	}
@@ -120,23 +101,34 @@ func (p *podCIDRPool) hasAvailableIPs() bool {
 	return false
 }
 
-func (p *podCIDRPool) dump() (ipToOwner map[string]string, usedIPs, availableIPs, numPodCIDRs uint64, err error) {
+func (p *podCIDRPool) dump() (ipToOwner map[string]string, usedIPs, freeIPs, numPodCIDRs int, err error) {
 	// TODO(gandro): Use the Snapshot interface to avoid locking during dump
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
 	ipToOwner = map[string]string{}
-	for _, alloc := range p.pool {
-		usedIPs += uint64(alloc.Used())
-		availableIPs += uint64(alloc.Free())
-		numPodCIDRs += 1
-
-		alloc.ForEach(func(ip net.IP) {
+	for _, ipAllocator := range p.ipAllocators {
+		usedIPs += ipAllocator.Used()
+		freeIPs += ipAllocator.Free()
+		ipAllocator.ForEach(func(ip net.IP) {
 			ipToOwner[ip.String()] = ""
 		})
 	}
+	numPodCIDRs = len(p.ipAllocators)
 
-	return ipToOwner, usedIPs, availableIPs, numPodCIDRs, nil
+	return
+}
+
+func (p *podCIDRPool) free() int {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	free := 0
+	for _, ipAllocator := range p.ipAllocators {
+		free += ipAllocator.Free()
+	}
+
+	return free
 }
 
 func (p *podCIDRPool) status() types.UsedPodCIDRMap {
@@ -145,40 +137,76 @@ func (p *podCIDRPool) status() types.UsedPodCIDRMap {
 
 	result := types.UsedPodCIDRMap{}
 
-	totalAvailableIPs := uint64(0)
-	unusedAllocators := map[string]*ipallocator.Range{}
-	for cidr, alloc := range p.pool {
-		status := types.PodCIDRStatusInUse
-		if alloc.Free() <= depletionThreshold {
-			status = types.PodCIDRStatusDepleted
-		}
-
-		totalAvailableIPs += uint64(alloc.Free())
-		if alloc.Used() == 0 {
-			unusedAllocators[cidr] = alloc
-		}
-
-		result[cidr] = types.UsedPodCIDR{
-			Status: status,
-		}
-	}
-
-	// check if unused allocated can be released
-	for cidr, alloc := range unusedAllocators {
-		availableIPs := uint64(alloc.Free())
-		if totalAvailableIPs-availableIPs > releaseThreshold {
-			log.WithField(logfields.CIDR, cidr).Debug("removing pod CIDR from allocation pool")
-
-			totalAvailableIPs -= availableIPs
-			p.released[cidr] = struct{}{}
-			delete(p.pool, cidr)
-		}
-	}
-
-	// update status for all released pod CIDRs
-	for podCIDR := range p.released {
-		result[podCIDR] = types.UsedPodCIDR{
+	// Mark all released pod CIDRs as released.
+	for cidrStr := range p.released {
+		result[cidrStr] = types.UsedPodCIDR{
 			Status: types.PodCIDRStatusReleased,
+		}
+	}
+
+	// Compute the total number of free and used IPs for all non-released pod
+	// CIDRs.
+	totalFree := 0
+	totalUsed := 0
+	for _, r := range p.ipAllocators {
+		cidrNet := r.CIDR()
+		if _, released := p.released[cidrNet.String()]; released {
+			continue
+		}
+		totalFree += r.Free()
+		totalUsed += r.Used()
+	}
+
+	if totalFree < depletionThreshold {
+		// If the total number of free IPs is below the depletion threshold,
+		// then mark all pod CIDRs as depleted, unless they have already been
+		// released.
+		for _, ipAllocator := range p.ipAllocators {
+			cidrNet := ipAllocator.CIDR()
+			cidrStr := cidrNet.String()
+			if _, released := p.released[cidrStr]; released {
+				continue
+			}
+			result[cidrStr] = types.UsedPodCIDR{
+				Status: types.PodCIDRStatusDepleted,
+			}
+		}
+	} else {
+		// Iterate over pod CIDRs in reverse order so we prioritize releasing
+		// later pod CIDRs.
+		for i := len(p.ipAllocators) - 1; i >= 0; i-- {
+			ipAllocator := p.ipAllocators[i]
+			cidrNet := ipAllocator.CIDR()
+			cidrStr := cidrNet.String()
+			if _, released := p.released[cidrStr]; released {
+				continue
+			}
+			free := ipAllocator.Free()
+			_ = free
+			var status types.UsedPodCIDRStatus
+			if i == 0 || ipAllocator.Used() > 0 {
+				// If this is the first pod CIDR or it is used, then mark it as
+				// in-use or depleted.
+				if ipAllocator.Free() == 0 {
+					status = types.PodCIDRStatusDepleted
+				} else {
+					status = types.PodCIDRStatusInUse
+				}
+			} else if free := ipAllocator.Free(); totalFree-free >= releaseThreshold {
+				// Otherwise, if the pod CIDR is not used and releasing it would
+				// not take us below the release threshold, then release it and
+				// mark it as released.
+				p.released[cidrStr] = struct{}{}
+				totalFree -= free
+				status = types.PodCIDRStatusReleased
+				log.WithField(logfields.CIDR, cidrStr).Debug("releasing pod CIDR")
+			} else {
+				// Otherwise, mark the pod CIDR as in-use.
+				status = types.PodCIDRStatusInUse
+			}
+			result[cidrStr] = types.UsedPodCIDR{
+				Status: status,
+			}
 		}
 	}
 
@@ -189,51 +217,102 @@ func (p *podCIDRPool) updatePool(podCIDRs []string) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	podCIDRSet := map[string]struct{}{}
+	// FIXME check for duplicates in podCIDRs
+
+	// Special case: the first call to updatePool() with at least one valid pod
+	// CIDR will create the initial allocators. The first pod CIDR is treated as
+	// a special case and will never be released.
+	if len(p.ipAllocators) == 0 {
+		if len(podCIDRs) == 0 {
+			log.Error("no pod CIDRs")
+			return
+		}
+
+		ipAllocators := make([]*ipallocator.Range, 0, len(podCIDRs))
+		for _, cidrStr := range podCIDRs {
+			_, cidrNet, err := net.ParseCIDR(cidrStr)
+			if err != nil {
+				log.WithError(err).WithField(logfields.CIDR, cidrStr).Error("ignoring invalid pod CIDR")
+				continue
+			}
+			ipAllocator, err := ipallocator.NewCIDRRange(cidrNet)
+			if err != nil {
+				log.WithError(err).WithField(logfields.CIDR, cidrStr).Error("cannot create *ipallocator.Range")
+				continue
+			}
+			ipAllocators = append(ipAllocators, ipAllocator)
+		}
+
+		if len(ipAllocators) == 0 {
+			log.Error("no valid pod CIDRs")
+			return
+		}
+
+		p.ipAllocators = ipAllocators
+		return
+	}
+
+	// Ignore invalid CIDRs.
+	cidrNets := make([]*net.IPNet, 0, len(podCIDRs))
+	cidrStrSet := make(map[string]struct{}, len(podCIDRs))
 	for _, podCIDR := range podCIDRs {
-		podCIDRSet[podCIDR] = struct{}{}
-
-		if _, ok := p.released[podCIDR]; ok {
-			continue // already released
-		}
-
-		if _, ok := p.pool[podCIDR]; ok {
-			continue // already exists
-		}
-
-		log.WithField(logfields.CIDR, podCIDR).Debug("adding new pod CIDR to allocation pool")
-		alloc, err := newPodCIDRAllocator(podCIDR)
+		_, cidr, err := net.ParseCIDR(podCIDR)
 		if err != nil {
-			log.
-				WithError(err).
-				WithField(logfields.CIDR, podCIDR).
-				Error("failed to add pod CIDR to allocation pool")
+			log.WithError(err).WithField(logfields.CIDR, podCIDR).Error("ignoring invalid pod CIDR")
 			continue
 		}
-
-		p.pool[podCIDR] = alloc
+		cidrNets = append(cidrNets, cidr)
+		cidrStrSet[cidr.String()] = struct{}{}
 	}
 
-	// we allocate from the pod CIDRs in the order they are listed here
-	p.podCIDRs = podCIDRs
+	firstCIDRNet := p.ipAllocators[0].CIDR()
+	if _, ok := cidrStrSet[firstCIDRNet.String()]; !ok {
+		log.WithField(logfields.CIDR, firstCIDRNet.String()).Error("first pod CIDR was removed by operator")
+	}
 
-	// remove any released CIDRs no longer present in the CRD
-	for cidr := range p.released {
-		if _, ok := podCIDRSet[cidr]; !ok {
-			delete(p.released, cidr)
+	// Remove any released pod CIDRs no longer present in the CRD.
+	for cidrStr := range p.released {
+		if _, ok := cidrStrSet[cidrStr]; !ok {
+			delete(p.released, cidrStr)
 		}
 	}
 
-	// sanity check: did pod CIDRs get removed without prior release
-	for cidr := range p.pool {
-		if _, ok := podCIDRSet[cidr]; !ok {
-			log.
-				WithField(logfields.CIDR, cidr).
-				Error("pod CIDR was removed from CiliumNode CRD without the agent releasing it first." +
-					"This will likely lead to IP conflicts if this CIDR is reused.")
-			delete(p.pool, cidr)
+	// newIPAllocators is the new slice of IP allocators.
+	newIPAllocators := make([]*ipallocator.Range, 0, len(podCIDRs))
+
+	// addedCIDRs is the set of pod CIDRs that have been added to newIPAllocators.
+	addedCIDRs := make(map[string]struct{}, len(p.ipAllocators))
+
+	// Add existing IP allocators to newIPAllocators in order.
+	for i, ipAllocator := range p.ipAllocators {
+		cidrNet := ipAllocator.CIDR()
+		cidrStr := cidrNet.String()
+		if _, ok := cidrStrSet[cidrStr]; !ok {
+			if i != 0 && ipAllocator.Used() == 0 {
+				continue
+			}
+			log.WithField(logfields.CIDR, cidrStr).Error("in-use pod CIDR was removed by operator")
 		}
+		newIPAllocators = append(newIPAllocators, ipAllocator)
+		addedCIDRs[cidrStr] = struct{}{}
 	}
+
+	// Create and add new IP allocators to newIPAllocators.
+	for _, cidrNet := range cidrNets {
+		cidrStr := cidrNet.String()
+		if _, ok := addedCIDRs[cidrStr]; ok {
+			continue
+		}
+		ipAllocator, err := ipallocator.NewCIDRRange(cidrNet)
+		if err != nil {
+			log.WithError(err).WithField(logfields.CIDR, cidrStr).Error("cannot create *ipallocator.Range")
+			continue
+		}
+		newIPAllocators = append(newIPAllocators, ipAllocator)
+		addedCIDRs[cidrStr] = struct{}{} // Protect against duplicate CIDRs.
+	}
+
+	p.ipAllocators = newIPAllocators
 }
 
 func (p *podCIDRPool) markReleased(releasedCIDRs []string) {
@@ -314,6 +393,7 @@ func (c *crdWatcher) maintainPoolsLocked() {
 	}
 
 	// if we restored already released CIDRs make sure they are not used
+	// FIXME(twpayne) is this needed?
 	if len(c.previouslyReleased) > 0 {
 		for family, releasedCIDRs := range c.previouslyReleased {
 			if pool, ok := c.pools[family]; ok {
@@ -392,7 +472,7 @@ type clusterPoolAllocator struct {
 }
 
 func newClusterPoolAllocator(family Family, k8sEventReg K8sEventRegister) Allocator {
-	pool := newPodCIDRPool(family)
+	pool := newPodCIDRPool()
 
 	crdWatcherInit.Do(func() {
 		nodeClient := k8s.CiliumClient().CiliumV2().CiliumNodes()
