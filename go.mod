@@ -78,7 +78,7 @@ require (
 	github.com/spf13/pflag v1.0.5
 	github.com/spf13/viper v1.8.1
 	github.com/stretchr/testify v1.7.0
-	github.com/vishvananda/netlink v1.1.1-0.20210510164352-d17758a128bf
+	github.com/vishvananda/netlink v1.1.1-0.20211101163509-b10eb8fe5cf6
 	github.com/vishvananda/netns v0.0.0-20201230012202-c4f3ca719c73
 	go.etcd.io/etcd/api/v3 v3.5.0
 	go.etcd.io/etcd/client/pkg/v3 v3.5.0
