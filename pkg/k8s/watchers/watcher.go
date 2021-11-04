@@ -354,6 +354,9 @@ func (k *K8sWatcher) InitK8sSubsystem(ctx context.Context) <-chan struct{} {
 		if !option.Config.DisableCiliumEndpointCRD {
 			k.WaitForCacheSync(k8sAPIGroupCiliumEndpointV2)
 		}
+		if option.Config.EnableEgressGateway {
+			k.WaitForCacheSync(k8sAPIGroupCiliumEgressNATPolicyV2)
+		}
 		close(cachesSynced)
 	}()
 
