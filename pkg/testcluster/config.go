@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
@@ -16,7 +15,7 @@ import (
 
 const (
 	clusterTypeKind       = "kind"
-	clusterTypeKubeConfig = "kube-config"
+	clusterTypeKubeconfig = "kubeconfig"
 	clusterTypeShell      = "shell"
 )
 
@@ -27,10 +26,10 @@ type kubeconfigProvisionerConfig struct {
 type shellProvisionerConfig struct {
 	setup  string
 	finish string
+	keep   bool
 }
 
 type config struct {
-	sync.Mutex
 	provisioner         string
 	kubeconfig          kubeconfigProvisionerConfig
 	shell               shellProvisionerConfig
@@ -72,24 +71,22 @@ func newConfig(options ...configOption) (*config, error) {
 func (c *config) addFlags(flagSet *flag.FlagSet) {
 	flagSet.StringVar(&c.provisioner, "provisioner", c.provisioner, "provisioner")
 	flagSet.StringVar(&c.kubeconfig.file, "kubeconfig-file", c.kubeconfig.file, "kubeconfig file")
-	flagSet.StringVar(&c.shell.setup, "shell-setup", c.shell.setup, "shell setup")
-	flagSet.StringVar(&c.shell.finish, "shell-finish", c.shell.finish, "shell finish")
+	flagSet.StringVar(&c.shell.setup, "shell-setup", c.shell.setup, "shell setup command")
+	flagSet.StringVar(&c.shell.finish, "shell-finish", c.shell.finish, "shell finish command")
+	flagSet.BoolVar(&c.shell.keep, "shell-keep", c.shell.keep, "shell keep temporary directory")
 	flagSet.StringVar(&c.clusterNamePrefix, "cluster-name-prefix", c.clusterNamePrefix, "cluster name prefix")
 	flagSet.StringVar(&c.namespaceNamePrefix, "namespace-name-prefix", c.namespaceNamePrefix, "namespace name prefix")
 }
 
-func (c *config) environment() (env.Environment, error) {
-	c.Lock()
-	defer c.Unlock()
-
+func (c *config) environment(ctx context.Context) (env.Environment, error) {
 	if c.currentEnvironment != nil {
 		return c.currentEnvironment, nil
 	}
 
+	namespaceName := c.namespaceNameFunc(c.namespaceNamePrefix)
 	switch c.provisioner {
 	case clusterTypeKind:
 		clusterName := c.clusterNameFunc(c.clusterNamePrefix)
-		namespaceName := c.namespaceNameFunc(c.namespaceNamePrefix)
 		environment := env.New()
 		environment.Setup(
 			envfuncs.CreateKindCluster(clusterName),
@@ -101,17 +98,38 @@ func (c *config) environment() (env.Environment, error) {
 		)
 		c.currentEnvironment = environment
 		return c.currentEnvironment, nil
-	case clusterTypeKubeConfig:
-		c.currentEnvironment = env.NewWithKubeConfig(c.kubeconfig.file)
-		return c.currentEnvironment, nil
-	case clusterTypeShell:
-		environment := env.New()
+	case clusterTypeKubeconfig:
+		environment := env.NewWithKubeConfig(c.kubeconfig.file)
 		environment.Setup(
-			runShellCommand(c.shell.setup),
+			envfuncs.CreateNamespace(namespaceName),
 		)
 		environment.Finish(
-			runShellCommand(c.shell.finish),
+			envfuncs.DeleteNamespace(namespaceName),
 		)
+		c.currentEnvironment = environment
+		return c.currentEnvironment, nil
+	case clusterTypeShell:
+		tempDir, err := os.MkdirTemp("", "testcluster-*")
+		if err != nil {
+			return nil, err
+		}
+		kubeconfigFile := filepath.Join(tempDir, "kubeconfig")
+		if err := runShellCommand(ctx, c.shell.setup, kubeconfigFile); err != nil {
+			return nil, err
+		}
+		environment := env.NewWithKubeConfig(kubeconfigFile)
+		environment.Finish(
+			runShellCommandEnvFunc(c.shell.finish),
+			func(ctx context.Context, config *envconf.Config) (context.Context, error) {
+				if !c.shell.keep {
+					if err := os.RemoveAll(tempDir); err != nil {
+						return nil, err
+					}
+				}
+				return ctx, nil
+			},
+		)
+		c.currentEnvironment = environment
 		return c.currentEnvironment, nil
 	default:
 		return nil, fmt.Errorf("%s: unknown provisioner", c.provisioner)
@@ -122,25 +140,24 @@ func randomNameFunc(prefix string) string {
 	return envconf.RandomName(prefix, 16)
 }
 
-func runShellCommand(command string) env.Func {
+func runShellCommandEnvFunc(command string) env.Func {
 	return func(ctx context.Context, config *envconf.Config) (context.Context, error) {
 		if command == "" {
 			return ctx, nil
 		}
 
-		shell, ok := os.LookupEnv("SHELL")
-		if !ok {
-			shell = "/bin/sh"
-		}
-
-		cmd := exec.CommandContext(ctx, shell, "-c", command)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := runShellCommand(ctx, command); err != nil {
 			return nil, err
 		}
 
 		return ctx, nil
 	}
+}
+
+func runShellCommand(ctx context.Context, command string, args ...string) error {
+	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

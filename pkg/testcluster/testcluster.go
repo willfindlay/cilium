@@ -1,6 +1,7 @@
 package testcluster
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -9,25 +10,25 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/env"
 )
 
-var globalConfig *config
-
-func Environment(t *testing.T) env.Environment {
-	t.Helper()
-	environment, err := globalConfig.environment()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return environment
-}
+// Env is the test environment.
+var Env env.Environment
 
 func Main(m *testing.M) {
-	var err error
-	globalConfig, err = newConfig()
+	c, err := newConfig()
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	globalConfig.addFlags(flag.CommandLine)
+
+	c.addFlags(flag.CommandLine)
 	flag.Parse()
-	os.Exit(m.Run())
+
+	ctx := context.Background()
+	Env, err = c.environment(ctx)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	os.Exit(Env.Run(m))
 }

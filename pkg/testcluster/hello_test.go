@@ -94,8 +94,7 @@ func TestWaitForResources(t *testing.T) {
 			return ctx
 		}).Feature()
 
-	testenv := testcluster.Environment(t)
-	testenv.Test(t, depFeature)
+	testcluster.Env.Test(t, depFeature)
 }
 
 func newDeployment(namespace string, name string, replicas int32) *appsv1.Deployment {
